@@ -1,9 +1,9 @@
 import pickle
-import numpy as np
 import re
 import os
 import httpx
 import urllib.parse
+import base64
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -14,14 +14,17 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from starlette.requests import Request
 
+# Optional Gemini import
 try:
     from google import genai
 except Exception:
     genai = None
 
+# ------------------ APP SETUP ------------------
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="PhishGuard API", version="1.0.0")
+app = FastAPI(title="PhishGuard API", version="2.0.0")
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -32,11 +35,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ------------------ ENV ------------------
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/ealvaradob/bert-finetuned-phishing"
+
+# ------------------ MODELS ------------------
 
 class URLRequest(BaseModel):
     url: str
@@ -52,28 +59,15 @@ class AnalysisResult(BaseModel):
     explanation: str
     virustotal_detections: Optional[int] = None
 
-SUSPICIOUS_KEYWORDS_EMAIL = [
-    "verify your account", "click here immediately", "your account will be suspended",
-    "confirm your password", "unusual activity", "update your payment",
-    "you have won", "claim your prize", "limited time offer",
-    "act now", "urgent action required", "bank account", "social security",
-]
+# ------------------ CONSTANTS ------------------
 
 SUSPICIOUS_TLDS = {".xyz", ".tk", ".ml", ".ga", ".cf", ".gq", ".top", ".work", ".loan"}
-TRUSTED_DOMAINS = {"google.com", "github.com", "microsoft.com", "apple.com", "amazon.com"}
 
-RF_MODEL = None
-USE_LOCAL_MODEL = False
-try:
-    with open("model.pkl", "rb") as f:
-        RF_MODEL = pickle.load(f)
-    USE_LOCAL_MODEL = True
-except FileNotFoundError:
-    RF_MODEL = None
-    USE_LOCAL_MODEL = False
+# ------------------ FEATURE EXTRACTION ------------------
 
-def extract_url_features(url: str) -> dict:
+def extract_url_features(url: str) -> list[str]:
     flags = []
+
     try:
         parsed = urllib.parse.urlparse(url)
         hostname = parsed.hostname or ""
@@ -82,251 +76,175 @@ def extract_url_features(url: str) -> dict:
 
         if "@" in url:
             flags.append("Contains '@' symbol — used to obscure true destination")
+
         if re.match(r"\d{1,3}(\.\d{1,3}){3}", hostname):
             flags.append("IP address used instead of domain name")
-        if full.count("-") > 3:
-            flags.append("Excessive hyphens in domain — common in spoofed domains")
-        if len(url) > 75:
-            flags.append(f"Unusually long URL ({len(url)} chars)")
-        if full.count(".") > 4:
-            flags.append("Deep subdomain nesting — often used to fake legitimacy")
+
         if any(full.endswith(tld) for tld in SUSPICIOUS_TLDS):
             flags.append("Suspicious top-level domain")
+
         if "https" not in full:
             flags.append("No HTTPS — connection is not encrypted")
-        for brand in ["paypal", "apple", "microsoft", "google", "amazon", "netflix"]:
-            if brand in hostname and not hostname.endswith(f"{brand}.com"):
-                flags.append(f"Brand name '{brand}' in subdomain — possible spoofing")
-        if re.search(r"(login|signin|account|secure|verify|update|confirm)", full):
+
+        if re.search(r"(login|verify|secure|account|update|confirm)", full):
             flags.append("Sensitive action keyword in URL")
+
         if "//" in path:
             flags.append("Double slashes in path — redirect trick")
+
     except Exception:
-        flags.append("Malformed URL structure")
-    return {"flags": flags}
+        flags.append("Malformed URL")
 
-def extract_email_features(text: str, subject: str) -> dict:
-    flags = []
-    combined = (subject + " " + text).lower()
+    return flags
 
-    for kw in SUSPICIOUS_KEYWORDS_EMAIL:
-        if kw in combined:
-            flags.append(f"Urgency/manipulation phrase: \"{kw}\"")
+# ------------------ HUMANIZE FLAGS ------------------
 
-    links = re.findall(r"https?://\S+", text)
-    if len(links) > 3:
-        flags.append(f"Contains {len(links)} links — phishing emails often load with links")
+def humanize_flags(flags: list[str]) -> list[str]:
+    clean = []
 
-    if re.search(r"dear (customer|user|member|valued client)", combined):
-        flags.append("Generic salutation — legitimate orgs use your name")
+    for f in flags:
+        f = f.lower()
 
-    if re.search(r"\b(password|ssn|credit card|social security|bank account)\b", combined):
-        flags.append("Requests sensitive personal information")
+        if "https" in f:
+            clean.append("it does not use a secure connection")
+        elif "@" in f:
+            clean.append("it hides the real destination using an '@' symbol")
+        elif "brand" in f:
+            clean.append("it imitates a trusted brand")
+        elif "keyword" in f:
+            clean.append("it uses suspicious words like login or verify")
+        elif "ip" in f:
+            clean.append("it uses an IP address instead of a domain")
+        else:
+            clean.append("it shows suspicious patterns")
 
-    if re.search(r"(expires? in \d+|within \d+ hours?|limited time)", combined):
-        flags.append("Artificial time pressure — classic social engineering")
+    return clean
 
-    attachments = re.findall(r"\.(exe|zip|doc[xm]?|xls[xm]?|pdf)", combined)
-    if attachments:
-        flags.append(f"References attachment type(s): {', '.join(set(attachments))}")
+# ------------------ HUGGING FACE ------------------
 
-    return {"flags": flags, "links": links}
-
-async def hf_classify(text: str) -> tuple[str, float]:
+async def hf_classify(text: str):
     if not HF_API_KEY:
-        return _rule_based_fallback(text)
+        return rule_based(text)
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 HF_MODEL_URL,
-                headers={
-                    "Authorization": f"Bearer {HF_API_KEY}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
-                json={"inputs": text, "options": {"wait_for_model": True}},
+                headers={"Authorization": f"Bearer {HF_API_KEY}"},
+                json={"inputs": text},
             )
 
-        if resp.status_code != 200 or "application/json" not in resp.headers.get("content-type", ""):
-            return _rule_based_fallback(text)
+        if resp.status_code != 200:
+            return rule_based(text)
 
-        data = resp.json()
-        if isinstance(data, list) and data and isinstance(data[0], list):
-            scores = {item["label"].upper(): item["score"] for item in data[0]}
-            phish_score = scores.get("PHISHING", scores.get("LABEL_1", 0.5))
-            label = "PHISHING" if phish_score > 0.5 else "SAFE"
-            conf = phish_score if label == "PHISHING" else 1 - phish_score
-            return label, round(conf, 3)
-    except Exception:
-        pass
+        data = resp.json()[0]
+        phish_score = next(x["score"] for x in data if "PHISH" in x["label"].upper())
 
-    return _rule_based_fallback(text)
+        label = "PHISHING" if phish_score > 0.5 else "SAFE"
+        conf = phish_score if label == "PHISHING" else 1 - phish_score
 
-def rf_classify(url: str) -> tuple[str, float]:
-    if not RF_MODEL:
-        return _rule_based_fallback(url)
-    feats = extract_url_features_numeric(url)
-    prob = RF_MODEL.predict_proba([feats])[0][1]
+        return label, round(conf, 3)
+
+    except:
+        return rule_based(text)
+
+# ------------------ RULE FALLBACK ------------------
+
+def rule_based(text: str):
+    score = sum(k in text.lower() for k in ["login", "verify", "secure", "@", "bank"])
+    prob = min(0.9, 0.2 + score * 0.15)
+
     label = "PHISHING" if prob > 0.5 else "SAFE"
-    return label, round(float(prob if label == "PHISHING" else 1 - prob), 3)
+    return label, prob
 
-def _rule_based_fallback(text: str) -> tuple[str, float]:
-    score = 0
-    t = text.lower()
-    triggers = ["phish", "free", "click", "verify", "account", "bank", "password", "urgent", "@", "login", "confirm", "secure", "update"]
-    for tr in triggers:
-        if tr in t:
-            score += 1
-    prob = min(0.95, 0.1 + score * 0.09)
-    label = "PHISHING" if prob > 0.5 else "SAFE"
-    return label, round(prob if label == "PHISHING" else 1 - prob, 3)
+# ------------------ GEMINI ------------------
 
-def humanize_flags(flags: list[str]) -> list[str]:
-    mapped = []
-    for f in flags:
-        f = f.lower()
-        if "no https" in f:
-            mapped.append("it does not use a secure (HTTPS) connection")
-        elif "@" in f:
-            mapped.append("it uses an '@' symbol to hide the real destination")
-        elif "brand name" in f:
-            mapped.append("it imitates a trusted brand name in the domain")
-        elif "keyword" in f:
-            mapped.append("it uses suspicious words like login or verify")
-        elif "ip address" in f:
-            mapped.append("it uses an IP address instead of a proper domain")
-        else:
-            mapped.append("it shows suspicious patterns")
-    return mapped
-
-class GeminiExplanation(BaseModel):
-    explanation: str
-
-def get_gemini_client():
-    if not GEMINI_API_KEY or genai is None:
-        return None
-    return genai.Client(api_key=GEMINI_API_KEY)
-
-async def gemini_explain(input_text: str, label: str, flags: list[str]) -> str:
+async def gemini_explain(input_text, label, flags):
     if not GEMINI_API_KEY or genai is None:
         if label == "PHISHING":
-            clean_flags = humanize_flags(flags[:2])
-            return "This URL appears to be a phishing attempt because " + " and ".join(clean_flags) + "."
-        return "This URL does not show strong signs of phishing."
-
-    client = get_gemini_client()
-    if not client:
-        if label == "PHISHING":
-            clean_flags = humanize_flags(flags[:2])
-            return "This URL appears to be a phishing attempt because " + " and ".join(clean_flags) + "."
-        return "This URL does not show strong signs of phishing."
-
-    prompt = (
-        f"You are a cybersecurity expert.\n"
-        f"The system classified the following as '{label}'.\n"
-        f"Input: {input_text[:300]}\n"
-        f"Key suspicious behaviors: {', '.join(humanize_flags(flags[:3])) or 'no major indicators'}\n"
-        f"Explain in 2 short sentences why this is {label.lower()}.\n"
-        f"Return valid JSON with one key: explanation."
-    )
+            clean = humanize_flags(flags[:2])
+            return "This URL appears to be a phishing attempt because " + " and ".join(clean) + "."
+        return "No strong phishing indicators detected."
 
     try:
-        result = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": GeminiExplanation,
-            },
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        prompt = (
+            f"You are a cybersecurity expert.\n"
+            f"This link was classified as {label}.\n\n"
+            f"Input: {input_text}\n\n"
+            f"Behaviors: {', '.join(humanize_flags(flags[:3]))}\n\n"
+            f"Explain in 2 short sentences. No bullets."
         )
-        return GeminiExplanation.model_validate_json(result.text).explanation
-    except Exception:
+
+        res = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt
+        )
+
+        return res.text.strip()
+
+    except:
         return f"Classified as {label} based on detected patterns."
 
-async def virustotal_check(url: str) -> Optional[int]:
+# ------------------ VIRUSTOTAL ------------------
+
+async def virustotal_check(url: str):
     if not VIRUSTOTAL_API_KEY:
         return None
+
     try:
-        import base64
-        url_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-        async with httpx.AsyncClient(timeout=10) as client:
+        url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+
+        async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"https://www.virustotal.com/api/v3/urls/{url_id}",
-                headers={"x-apikey": VIRUSTOTAL_API_KEY},
+                headers={"x-apikey": VIRUSTOTAL_API_KEY}
             )
-            if resp.status_code == 200:
-                stats = resp.json()["data"]["attributes"]["last_analysis_stats"]
-                return stats.get("malicious", 0) + stats.get("suspicious", 0)
-    except Exception:
-        pass
-    return None
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "PhishGuard API"}
+        data = resp.json()
+        stats = data["data"]["attributes"]["last_analysis_stats"]
+
+        return stats.get("malicious", 0) + stats.get("suspicious", 0)
+
+    except:
+        return None
+
+# ------------------ ROUTES ------------------
+
+@app.get("/")
+def root():
+    return {"message": "PhishGuard API running"}
 
 @app.post("/analyze-url", response_model=AnalysisResult)
 @limiter.limit("30/minute")
 async def analyze_url(request: Request, body: URLRequest):
+
     url = body.url.strip()
 
     if not url:
-        raise HTTPException(status_code=400, detail="URL cannot be empty")
+        raise HTTPException(400, "URL cannot be empty")
 
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    features = extract_url_features(url)
-    red_flags = features["flags"]
-    risk_score = len(red_flags)
+    flags = extract_url_features(url)
+    label, conf = await hf_classify(url)
 
-    ai_label, conf = await hf_classify(url)
-
-    if risk_score >= 2:
+    # Rule override
+    if len(flags) >= 2:
         label = "PHISHING"
-    else:
-        label = ai_label
 
-    if risk_score >= 3:
+    if len(flags) >= 3:
         conf = max(conf, 0.8)
 
-    if label == "PHISHING":
-        explanation = (
-            "This URL appears to be a phishing attempt because it contains "
-            + ", ".join(red_flags[:2])
-            + ". These are common indicators of malicious links."
-        )
-    else:
-        explanation = "No strong phishing indicators detected."
-
-    vt_detections = await virustotal_check(url)
+    explanation = await gemini_explain(url, label, flags)
+    vt = await virustotal_check(url)
 
     return AnalysisResult(
         label=label,
         confidence=round(conf, 3),
-        red_flags=red_flags,
+        red_flags=flags,
         explanation=explanation,
-        virustotal_detections=vt_detections,
-    )
-
-@app.post("/analyze-email", response_model=AnalysisResult)
-@limiter.limit("20/minute")
-async def analyze_email(request: Request, body: EmailRequest):
-    text = body.email_text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Email text cannot be empty")
-
-    features = extract_email_features(text, body.subject or "")
-    label, conf = await hf_classify(f"{body.subject} {text}")
-    explanation = await gemini_explain(text[:400], label, features["flags"])
-
-    if len(features["flags"]) >= 3 and label == "PHISHING":
-        conf = min(0.99, conf + 0.08)
-
-    return AnalysisResult(
-        label=label,
-        confidence=round(conf, 3),
-        red_flags=features["flags"],
-        explanation=explanation,
+        virustotal_detections=vt
     )
