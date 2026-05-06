@@ -251,7 +251,7 @@ Tested on 200 URLs (100 phishing from PhishTank, 100 safe):
 1. New site → connect repo → set base directory to `frontend/`
 2. Build command: `npm run build`
 3. Publish directory: `dist`
-4. Add `VITE_API_URL=https://your-backend.onrender.com` in environment variables
+4. Add `VITE_API_URL=(https://phishguard-nz0n.onrender.com)` in environment variables
 
 ---
 
@@ -265,7 +265,6 @@ Pull requests welcome! For major changes, open an issue first.
 
 **Adeeba** · BTech CSE · [GitHub](https://github.com/yourusername) · [LinkedIn](https://linkedin.com/in/yourprofile)
 
-Built for Hack2Skill Hackathon 2026
 
 ---
 
