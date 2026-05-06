@@ -158,33 +158,33 @@ def rule_based(text: str):
     return label, prob
 
 # ------------------ GEMINI ------------------
+import google.generativeai as genai
 
+genai.configure(api_key=GEMINI_API_KEY)
 async def gemini_explain(input_text, label, flags):
-    if not GEMINI_API_KEY or genai is None:
-        if label == "PHISHING":
-            clean = humanize_flags(flags[:2])
-            return "This URL appears to be a phishing attempt because " + " and ".join(clean) + "."
-        return "No strong phishing indicators detected."
+    if not GEMINI_API_KEY:
+        clean = humanize_flags(flags[:2])
+        return "This URL appears to be a phishing attempt because " + " and ".join(clean) + "."
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
-        prompt = (
-            f"You are a cybersecurity expert.\n"
-            f"This link was classified as {label}.\n\n"
-            f"Input: {input_text}\n\n"
-            f"Behaviors: {', '.join(humanize_flags(flags[:3]))}\n\n"
-            f"Explain in 2 short sentences. No bullets."
-        )
+        prompt = f"""
+        This URL is classified as {label}.
+        Input: {input_text}
+        Signals: {', '.join(humanize_flags(flags[:3]))}
 
-        res = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt
-        )
+        Explain in 2 simple sentences why this is {label.lower()}.
+        No bullet points.
+        """
 
-        return res.text.strip()
+        res = model.generate_content(prompt)
 
-    except:
+        text = res.text.replace("\n", " ").replace("•", "").replace("- ", "")
+        return text.strip()
+
+    except Exception as e:
+        print("GEMINI ERROR:", e)
         return f"Classified as {label} based on detected patterns."
 
 # ------------------ VIRUSTOTAL ------------------
