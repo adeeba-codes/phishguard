@@ -44,11 +44,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten to your Netlify URL before final deploy
+    allow_origins=[
+        "https://phishguard-adeeba.netlify.app",
+        "http://localhost:5173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Environment variables
 # ─────────────────────────────────────────────────────────────────────────────
