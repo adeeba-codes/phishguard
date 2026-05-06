@@ -24,12 +24,15 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from starlette.requests import Request
+from dotenv import load_dotenv   # ← ADD
 
-# ── Safe single import of google-genai ───────────────────────────────────────
+load_dotenv()                    # ← ADD — reads your .env file
+
+# Safe single import of google-genai
 try:
     from google import genai as google_genai
 except Exception:
-    google_genai = None  # app still works — falls back to rule-based explanation
+    google_genai = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  App & middleware
@@ -54,7 +57,8 @@ HF_API_KEY         = os.getenv("HF_API_KEY", "")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 HF_MODEL_URL = (
-    "https://api-inference.huggingface.co/models/ealvaradob/bert-finetuned-phishing"
+   "https://router.huggingface.co/hf-inference/models/ealvaradob/bert-finetuned-phishing"
+
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,52 +261,54 @@ def rule_based(text: str) -> tuple[str, float]:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Gemini Flash explanation
 # ─────────────────────────────────────────────────────────────────────────────
-async def gemini_explain(input_text: str, label: str, flags: list[str]) -> str:
-    """
-    Calls Gemini 1.5 Flash to produce a plain-English explanation.
-    Falls back to a rule-based sentence if key is missing or call fails.
-    """
-    # ── Fallback (no API key or google-genai not installed) ──────────────────
-    if not GEMINI_API_KEY or google_genai is None:
-        human = humanize_flags(flags[:3])
-        if not human:
-            return (
-                f"This content appears to be {label.lower()} based on detected patterns. "
-                "Exercise caution before proceeding."
-            )
-        joined = " and ".join(human[:2])
-        if label == "PHISHING":
-            return f"This URL appears to be a phishing attempt because {joined}. Do not enter any personal information."
-        return "No significant phishing indicators were found. This content appears to be legitimate."
+GEMINI_MODELS = [
+    "gemini-2.0-flash-lite",  # fastest + cheapest, try first
+    "gemini-2.0-flash",       # fallback
+    "gemini-2.5-flash",       # last resort
+]
 
-    # ── Gemini call ──────────────────────────────────────────────────────────
+async def gemini_explain(input_text: str, label: str, flags: list[str]) -> str:
+    if not GEMINI_API_KEY or google_genai is None:
+        return _fallback_explanation(label, flags)
+
+    flag_text = "\n".join(f"- {f}" for f in flags) if flags else "- No specific flags"
+    prompt = (
+        f"You are a cybersecurity expert explaining threats to a non-technical user.\n\n"
+        f"This content was classified as: {label}\n"
+        f"Input analysed: {input_text[:300]}\n\n"
+        f"Detected red flags:\n{flag_text}\n\n"
+        f"Write exactly 2 sentences explaining why this is {label.lower()}. "
+        f"Be specific about the red flags. "
+        f"Use plain English — no bullet points, no markdown, no jargon."
+    )
+
     try:
         client = google_genai.Client(api_key=GEMINI_API_KEY)
-
-        flag_text = "\n".join(f"- {f}" for f in flags) if flags else "- No specific flags"
-        prompt = (
-            f"You are a cybersecurity expert explaining threats to a non-technical user.\n\n"
-            f"This content was classified as: {label}\n"
-            f"Input analysed: {input_text[:300]}\n\n"
-            f"Detected red flags:\n{flag_text}\n\n"
-            f"Write exactly 2 sentences explaining why this is {label.lower()}. "
-            f"Be specific about the red flags. "
-            f"Use plain English — no bullet points, no markdown, no jargon."
-        )
-
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
-        )
-
-        text = response.text.strip().replace("\n", " ").replace("•", "").replace("- ", "")
-        return text
-
+        for model in GEMINI_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                text = response.text.strip().replace("\n", " ")
+                print(f"Gemini OK using {model}")
+                return text
+            except Exception as e:
+                print(f"Gemini {model} failed: {e}")
+                continue   # try next model
     except Exception as e:
-        print(f"Gemini error: {e}")
-        human = humanize_flags(flags[:2])
+        print(f"Gemini client error: {e}")
+
+    return _fallback_explanation(label, flags)
+
+
+def _fallback_explanation(label: str, flags: list[str]) -> str:
+    """Used when all Gemini models fail or quota is exhausted."""
+    human = humanize_flags(flags[:2])
+    if label == "PHISHING":
         joined = " and ".join(human) if human else "suspicious patterns"
-        return f"Classified as {label} because {joined}."
+        return f"This appears to be a phishing attempt because {joined}. Do not enter any personal information."
+    return "No significant phishing indicators were found. This content appears to be legitimate."
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  VirusTotal check (optional — 500 req/day free)
